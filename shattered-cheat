@@ -1,0 +1,200 @@
+#!/usr/bin/python3
+import argparse
+import logging
+import sys
+import subprocess
+import tempfile
+import os
+import json
+import gzip
+import contextlib
+import datetime
+
+log = logging.getLogger("shattered-cheat")
+
+
+class Fail(Exception):
+    pass
+
+
+class Cheater(contextlib.ExitStack):
+    def __init__(self, args):
+        super().__init__()
+        self.args = args
+        if args.workdir:
+            self.workdir = args.workdir
+        else:
+            self.workdir = self.enter_context(tempfile.TemporaryDirectory())
+        self.now = datetime.datetime.now()
+        self.savefile = self.now.strftime(f"game{self.args.slot}-%Y-%m-%d-%H:%M:%S.dat")
+        self.editfile = os.path.join(self.workdir, f"game{self.args.slot}.json")
+        self.data = None
+
+    def cleanup(self):
+        """
+        Remove work files
+        """
+        os.unlink(self.editfile)
+
+    def fetch(self):
+        """
+        Get the save file via adb
+        """
+        log.info("Fetching save data from game to %s", self.savefile)
+        subprocess.run(
+                ["adb", "pull",
+                 f"/data/data/com.shatteredpixel.shatteredpixeldungeon/files/game{self.args.slot}/game.dat",
+                 self.savefile], check=True)
+
+    def load(self):
+        """
+        Fetch the savefile if needed, and parse it
+        """
+        if os.path.exists(self.editfile):
+            log.info("Loading %s", self.editfile)
+            with open(self.editfile, "rt") as fdin:
+                self.data = json.load(fdin)
+        else:
+            self.fetch()
+            log.info("Loading %s", self.savefile)
+            with gzip.open(self.savefile, "rt") as fdin:
+                self.data = json.load(fdin)
+
+        with open(os.path.join(self.editfile), "wt") as out:
+            log.info("Saving %s", self.editfile)
+            json.dump(self.data, out, indent=1)
+
+    def heal(self):
+        """
+        Fully heal the hero
+        """
+        if self.data["hero"]["HP"] < self.data["hero"]["HT"]:
+            log.info("Set HP to %d", self.data["hero"]["HT"])
+            self.data["hero"]["HP"] = self.data["hero"]["HT"]
+
+    def bless(self):
+        """
+        Uncurse and repair all items
+        """
+        for el in self.iter_objects():
+            # if el["cursed"]:
+            #     log.info("Remove curse from %s", el["__className"])
+            #     el["cursed"] = False
+            if el.get("durability", 1000) < 100:
+                log.info("Set %s durability to 100", el["__className"])
+                el["durability"] = 100
+
+    def ensure_essentials(self):
+        """
+        Make sure essential items are in the inventory
+        """
+        essentials = [
+            {
+                "cursedKnown": False,
+                "quantity": 10,
+                "levelKnown": False,
+                "cursed": False,
+                "level": 0,
+                "__className": "com.shatteredpixel.shatteredpixeldungeon.items.scrolls.ScrollOfMagicMapping",
+            },
+        ]
+        for el in self.iter_objects():
+            for essential in essentials:
+                if el["__className"] == essential["__className"]:
+                    essential["skip"] = True
+
+        for essential in essentials:
+            if not essential.get("skip", False):
+                log.info("Add %s", essential["__className"])
+                self.data["hero"]["inventory"].append(essential)
+
+    def iter_objects(self, inventory=None):
+        """
+        Generate all objects belonging to the hero (wielded or in inventory)
+        """
+        if inventory is None:
+            if self.data["hero"]["weapon"]:
+                yield self.data["hero"]["weapon"]
+            if self.data["hero"]["armor"]:
+                yield self.data["hero"]["armor"]
+            yield from self.iter_objects(self.data["hero"]["inventory"])
+        else:
+            for el in inventory:
+                if "inventory" in el:
+                    yield from self.iter_objects(el["inventory"])
+                yield el
+
+    def multiply(self, inventory=None):
+        """
+        Multiply consumable items
+        """
+        MULTIPLIABLE = [
+            "com.shatteredpixel.shatteredpixeldungeon.items.food.",
+            "com.shatteredpixel.shatteredpixeldungeon.items.potions.",
+            "com.shatteredpixel.shatteredpixeldungeon.plants.",
+            "com.shatteredpixel.shatteredpixeldungeon.items.scrolls.",
+            "com.shatteredpixel.shatteredpixeldungeon.items.stones.",
+            "com.shatteredpixel.shatteredpixeldungeon.items.Stylus",
+            "com.shatteredpixel.shatteredpixeldungeon.items.Torch",
+        ]
+        # if self.data["gold"] < 2000:
+        #     self.data["gold"] = 2000
+        for el in self.iter_objects():
+            for cn in MULTIPLIABLE:
+                if el["__className"].startswith(cn):
+                    if el["quantity"] < 10:
+                        log.info("Set %s quantity to 10", el["__className"])
+                        el["quantity"] = 10
+
+    def store(self):
+        """
+        Save self.data into the game
+        """
+        with open(self.editfile, "wt") as fd:
+            log.info("Saving %s", self.editfile)
+            json.dump(self.data, fd, indent=1)
+
+        if not self.args.no_save:
+            with tempfile.NamedTemporaryFile("wt") as out:
+                log.info("Encoding to %s", out.name)
+                with gzip.open(out.name, "wt") as out:
+                    json.dump(self.data, out)
+
+                log.info("Sending %s to game", out.name)
+                subprocess.run(
+                        ["adb", "push", out.name,
+                         f"/data/data/com.shatteredpixel.shatteredpixeldungeon/files/game{self.args.slot}/game.dat"],
+                        check=True)
+
+
+def main():
+    parser = argparse.ArgumentParser(
+            description="serve a file over HTTP over NAT")
+    parser.add_argument("--verbose", "-v", action="store_true", help="verbose output")
+    parser.add_argument("--debug", action="store_true", help="debug output")
+    parser.add_argument("-w", "--workdir", help="working directory (default: a temporary directory)")
+    parser.add_argument("-n", "--no-save", action="store_true", help="do not save to the game")
+    parser.add_argument("-s", "--slot", type=int, default=1, help="game slot to use. Default: %(default)s")
+    args = parser.parse_args()
+
+    log_format = "%(asctime)-15s %(levelname)s %(message)s"
+    level = logging.WARN
+    if args.debug:
+        level = logging.DEBUG
+    elif args.verbose:
+        level = logging.INFO
+    logging.basicConfig(level=level, stream=sys.stderr, format=log_format)
+
+    with Cheater(args) as cheater:
+        cheater.load()
+        cheater.heal()
+        cheater.bless()
+        cheater.ensure_essentials()
+        cheater.multiply()
+        cheater.store()
+        if not args.no_save:
+            cheater.cleanup()
+
+
+if __name__ == "__main__":
+    main()
